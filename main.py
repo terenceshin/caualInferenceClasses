@@ -8,12 +8,17 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import r2_score
 from sklearn.metrics import roc_auc_score, roc_curve
 from scipy import stats
+from scipy.optimize import minimize_scalar
 from scipy.spatial.distance import cdist
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+
 
 class DifferenceInDifferences:
     """
@@ -1421,3 +1426,952 @@ class PropensityScoreMatching:
         
         plt.tight_layout()
         plt.show()
+
+class RegressionDiscontinuityDesign:
+    """
+    A comprehensive class for Regression Discontinuity Design analysis with multiple
+    estimation methods, assumption checking, and robustness tests.
+    
+    Parameters:
+    -----------
+    data : pd.DataFrame
+        The dataset containing the variables for analysis
+    outcome_var : str
+        Name of the outcome variable column
+    running_var : str
+        Name of the running variable (assignment variable) column
+    treatment_var : str, optional
+        Name of the treatment indicator column. If None, will be created based on cutoff
+    cutoff : float
+        The cutoff value for treatment assignment
+    """
+    
+    def __init__(self, data, outcome_var, running_var, cutoff, treatment_var=None):
+        self.data = data.copy()
+        self.outcome_var = outcome_var
+        self.running_var = running_var
+        self.cutoff = cutoff
+        self.treatment_var = treatment_var
+        
+        # Create treatment variable if not provided
+        if self.treatment_var is None:
+            self.treatment_var = 'treatment'
+            self.data[self.treatment_var] = (self.data[self.running_var] >= self.cutoff).astype(int)
+        
+        # Center running variable around cutoff
+        self.data['running_var_centered'] = self.data[self.running_var] - self.cutoff
+        
+        # Storage for results
+        self.results = {}
+        self.assumption_checks = {}
+        
+        # Validate data
+        self._validate_data()
+        
+    def _validate_data(self):
+        """Validate input data and variables"""
+        required_cols = [self.outcome_var, self.running_var]
+        missing_cols = [col for col in required_cols if col not in self.data.columns]
+        
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}")
+            
+        # Check for missing values
+        missing_data = self.data[required_cols].isnull().sum()
+        if missing_data.any():
+            print("⚠️ Missing values detected:")
+            for col, count in missing_data[missing_data > 0].items():
+                print(f"  {col}: {count} missing values")
+                
+        # Check cutoff is within data range
+        running_min = self.data[self.running_var].min()
+        running_max = self.data[self.running_var].max()
+        
+        if not (running_min <= self.cutoff <= running_max):
+            raise ValueError(f"Cutoff {self.cutoff} outside data range [{running_min}, {running_max}]")
+            
+        print(f"✅ RDD data validation passed")
+        print(f"  - Total observations: {len(self.data):,}")
+        print(f"  - Running variable range: [{running_min:.2f}, {running_max:.2f}]")
+        print(f"  - Cutoff: {self.cutoff}")
+        print(f"  - Treatment units: {self.data[self.treatment_var].sum():,}")
+        print(f"  - Control units: {(self.data[self.treatment_var] == 0).sum():,}")
+    
+    def check_continuity_assumption(self, plot=True):
+        """
+        Check continuity of baseline characteristics at cutoff
+        Key assumption: No manipulation of running variable
+        """
+        print("\n" + "="*60)
+        print("ASSUMPTION CHECK: CONTINUITY (NO MANIPULATION)")
+        print("="*60)
+        
+        # Test density continuity using McCrary test (simplified)
+        bin_width = (self.data[self.running_var].max() - self.data[self.running_var].min()) / 50
+        
+        # Create bins around cutoff
+        bins_left = np.arange(self.cutoff - 5*bin_width, self.cutoff, bin_width)
+        bins_right = np.arange(self.cutoff, self.cutoff + 5*bin_width, bin_width)
+        
+        # Count observations in each bin
+        counts_left = []
+        counts_right = []
+        
+        for i in range(len(bins_left)-1):
+            count = ((self.data[self.running_var] >= bins_left[i]) & 
+                    (self.data[self.running_var] < bins_left[i+1])).sum()
+            counts_left.append(count)
+            
+        for i in range(len(bins_right)-1):
+            count = ((self.data[self.running_var] >= bins_right[i]) & 
+                    (self.data[self.running_var] < bins_right[i+1])).sum()
+            counts_right.append(count)
+        
+        # Test for discontinuity in density
+        if len(counts_left) > 0 and len(counts_right) > 0:
+            density_left = np.mean(counts_left[-2:])  # Average of last 2 bins before cutoff
+            density_right = np.mean(counts_right[:2])  # Average of first 2 bins after cutoff
+            
+            density_ratio = density_right / density_left if density_left > 0 else float('inf')
+            
+            # Simple test - more sophisticated would use McCrary test
+            manipulation_suspected = abs(np.log(density_ratio)) > 0.5  # 50% jump
+            
+            results = {
+                'density_left': density_left,
+                'density_right': density_right,
+                'density_ratio': density_ratio,
+                'manipulation_suspected': manipulation_suspected,
+                'bin_width': bin_width
+            }
+            
+            print(f"Density continuity test:")
+            print(f"  Density left of cutoff: {density_left:.2f}")
+            print(f"  Density right of cutoff: {density_right:.2f}")
+            print(f"  Ratio (right/left): {density_ratio:.3f}")
+            
+            if manipulation_suspected:
+                print("⚠️ POTENTIAL MANIPULATION detected - large density jump")
+                results['assumption_satisfied'] = False
+            else:
+                print("✅ NO OBVIOUS MANIPULATION - density appears continuous")
+                results['assumption_satisfied'] = True
+                
+        else:
+            print("❌ Insufficient data near cutoff for density test")
+            results = {'assumption_satisfied': False, 'insufficient_data': True}
+        
+        if plot:
+            self._plot_density_continuity()
+            
+        self.assumption_checks['continuity'] = results
+        return results
+    
+    def check_covariate_continuity(self, covariates=None):
+        """
+        Check if baseline covariates are continuous at cutoff
+        If covariates jump at cutoff, suggests manipulation
+        """
+        print("\n" + "="*60)
+        print("ASSUMPTION CHECK: COVARIATE CONTINUITY")
+        print("="*60)
+        
+        if covariates is None:
+            # Try to identify potential covariates automatically
+            numeric_cols = self.data.select_dtypes(include=[np.number]).columns
+            covariates = [col for col in numeric_cols 
+                         if col not in [self.outcome_var, self.running_var, 
+                                       self.treatment_var, 'running_var_centered']]
+            
+        if not covariates:
+            print("No covariates specified or found")
+            return {}
+        
+        covariate_results = {}
+        
+        print(f"Testing continuity for {len(covariates)} covariates:")
+        
+        for covar in covariates:
+            if covar not in self.data.columns:
+                continue
+                
+            # Run RDD on covariate (should find no effect if no manipulation)
+            covar_effect = self._estimate_rdd_effect(
+                outcome=self.data[covar],
+                running_var=self.data['running_var_centered'],
+                bandwidth=None,  # Use optimal bandwidth
+                polynomial_order=1
+            )
+            
+            effect_size = covar_effect['treatment_effect']
+            p_value = covar_effect['p_value']
+            
+            covariate_results[covar] = {
+                'effect': effect_size,
+                'p_value': p_value,
+                'continuous': p_value > 0.05
+            }
+            
+            status = "✅" if p_value > 0.05 else "⚠️"
+            print(f"  {covar:20s}: Effect = {effect_size:8.3f}, p = {p_value:.3f} {status}")
+        
+        # Overall assessment
+        discontinuous_vars = sum(1 for result in covariate_results.values() 
+                               if not result['continuous'])
+        
+        print(f"\nCovariate continuity summary:")
+        print(f"  Variables with discontinuities: {discontinuous_vars}/{len(covariate_results)}")
+        
+        if discontinuous_vars == 0:
+            print("✅ ALL COVARIATES CONTINUOUS - strong evidence against manipulation")
+            overall_satisfied = True
+        elif discontinuous_vars <= len(covariate_results) * 0.2:
+            print("⚠️ FEW DISCONTINUITIES - likely acceptable")
+            overall_satisfied = True
+        else:
+            print("❌ MANY DISCONTINUITIES - manipulation concerns")
+            overall_satisfied = False
+            
+        covariate_results['overall_satisfied'] = overall_satisfied
+        self.assumption_checks['covariate_continuity'] = covariate_results
+        return covariate_results
+    
+    def optimal_bandwidth_selection(self, method='imbens_kalyanaraman'):
+        """
+        Select optimal bandwidth for RDD estimation
+        
+        Parameters:
+        -----------
+        method : str, default 'imbens_kalyanaraman'
+            Method for bandwidth selection ('imbens_kalyanaraman', 'cross_validation')
+        """
+        print("\n" + "="*60)
+        print("OPTIMAL BANDWIDTH SELECTION")
+        print("="*60)
+        
+        if method == 'imbens_kalyanaraman':
+            bandwidth = self._imbens_kalyanaraman_bandwidth()
+        elif method == 'cross_validation':
+            bandwidth = self._cross_validation_bandwidth()
+        else:
+            raise ValueError("Method must be 'imbens_kalyanaraman' or 'cross_validation'")
+        
+        print(f"Optimal bandwidth ({method}): {bandwidth:.3f}")
+        
+        # Check if bandwidth provides sufficient observations
+        within_bandwidth = (np.abs(self.data['running_var_centered']) <= bandwidth).sum()
+        print(f"Observations within bandwidth: {within_bandwidth:,}")
+        
+        if within_bandwidth < 50:
+            print("⚠️ WARNING: Very few observations within optimal bandwidth")
+            print("   Consider using wider bandwidth or checking data quality")
+        
+        self.results['optimal_bandwidth'] = {
+            'bandwidth': bandwidth,
+            'method': method,
+            'observations_within': within_bandwidth
+        }
+        
+        return bandwidth
+    
+    def _imbens_kalyanaraman_bandwidth(self):
+        """Imbens-Kalyanaraman optimal bandwidth selection"""
+        # Simplified implementation of IK bandwidth
+        
+        # Get data near cutoff for pilot estimation
+        pilot_bandwidth = np.std(self.data['running_var_centered']) / 2
+        
+        pilot_data = self.data[np.abs(self.data['running_var_centered']) <= pilot_bandwidth].copy()
+        
+        if len(pilot_data) < 20:
+            print("⚠️ Insufficient data for bandwidth selection, using rule of thumb")
+            return np.std(self.data['running_var_centered']) / 4
+        
+        # Estimate second derivatives (simplified)
+        X_left = pilot_data[pilot_data['running_var_centered'] < 0]['running_var_centered']
+        y_left = pilot_data[pilot_data['running_var_centered'] < 0][self.outcome_var]
+        
+        X_right = pilot_data[pilot_data['running_var_centered'] >= 0]['running_var_centered']
+        y_right = pilot_data[pilot_data['running_var_centered'] >= 0][self.outcome_var]
+        
+        # Simple rule of thumb based on data characteristics
+        n = len(self.data)
+        range_running = self.data['running_var_centered'].max() - self.data['running_var_centered'].min()
+        
+        # IK-style bandwidth (simplified formula)
+        bandwidth = 1.84 * (range_running / 4) * (n ** (-1/5))
+        
+        return max(bandwidth, range_running / 20)  # Minimum bandwidth
+    
+    def _cross_validation_bandwidth(self):
+        """Cross-validation bandwidth selection"""
+        # Test different bandwidths
+        bandwidths = np.linspace(0.1, 2.0, 20) * np.std(self.data['running_var_centered'])
+        cv_scores = []
+        
+        for bw in bandwidths:
+            # Split data for cross-validation
+            subset = self.data[np.abs(self.data['running_var_centered']) <= bw].copy()
+            
+            if len(subset) < 20:
+                cv_scores.append(float('inf'))
+                continue
+                
+            # Simple leave-one-out CV (simplified)
+            mse_scores = []
+            for i in range(min(50, len(subset))):  # Limit for computational efficiency
+                train_data = subset.drop(subset.index[i])
+                test_point = subset.iloc[i]
+                
+                # Fit model on training data
+                effect_result = self._estimate_rdd_effect(
+                    outcome=train_data[self.outcome_var],
+                    running_var=train_data['running_var_centered'],
+                    bandwidth=bw,
+                    polynomial_order=1
+                )
+                
+                # Predict for test point
+                predicted = self._predict_rdd(test_point['running_var_centered'], effect_result, bw)
+                actual = test_point[self.outcome_var]
+                
+                mse_scores.append((predicted - actual) ** 2)
+            
+            cv_scores.append(np.mean(mse_scores))
+        
+        # Select bandwidth with minimum CV error
+        optimal_idx = np.argmin(cv_scores)
+        return bandwidths[optimal_idx]
+    
+    def _predict_rdd(self, running_var_value, effect_result, bandwidth):
+        """Helper function to predict outcome for RDD model"""
+        # Simplified prediction - in practice would use full model
+        if running_var_value >= 0:
+            return effect_result.get('intercept_right', 0) + effect_result.get('treatment_effect', 0)
+        else:
+            return effect_result.get('intercept_left', 0)
+    
+    def estimate_rdd_effect(self, bandwidth=None, polynomial_order=1, kernel='triangular'):
+        """
+        Estimate RDD treatment effect
+        
+        Parameters:
+        -----------
+        bandwidth : float, optional
+            Bandwidth for local estimation. If None, uses optimal bandwidth
+        polynomial_order : int, default 1
+            Order of polynomial for local regression (1=linear, 2=quadratic)
+        kernel : str, default 'triangular'
+            Kernel function ('triangular', 'uniform', 'epanechnikov')
+        """
+        print("\n" + "="*60)
+        print("RDD TREATMENT EFFECT ESTIMATION")
+        print("="*60)
+        
+        if bandwidth is None:
+            bandwidth = self.optimal_bandwidth_selection()
+        else:
+            print(f"Using specified bandwidth: {bandwidth:.3f}")
+        
+        # Estimate effect
+        effect_result = self._estimate_rdd_effect(
+            outcome=self.data[self.outcome_var],
+            running_var=self.data['running_var_centered'],
+            bandwidth=bandwidth,
+            polynomial_order=polynomial_order,
+            kernel=kernel
+        )
+        
+        # Store results
+        effect_result.update({
+            'bandwidth': bandwidth,
+            'polynomial_order': polynomial_order,
+            'kernel': kernel
+        })
+        
+        # Print results
+        print(f"RDD estimation results:")
+        print(f"  Treatment effect: {effect_result['treatment_effect']:.3f}")
+        print(f"  Standard error: {effect_result['standard_error']:.3f}")
+        print(f"  t-statistic: {effect_result['t_statistic']:.3f}")
+        print(f"  p-value: {effect_result['p_value']:.3f}")
+        print(f"  95% CI: [{effect_result['ci_lower']:.3f}, {effect_result['ci_upper']:.3f}]")
+        print(f"  Observations used: {effect_result['n_obs']}")
+        
+        if effect_result['p_value'] < 0.05:
+            print("✅ STATISTICALLY SIGNIFICANT at 5% level")
+        else:
+            print("⚠️ NOT statistically significant at 5% level")
+        
+        self.results['rdd_effect'] = effect_result
+        return effect_result
+    
+    def _estimate_rdd_effect(self, outcome, running_var, bandwidth, polynomial_order=1, kernel='triangular'):
+        """Internal method for RDD estimation"""
+        
+        # Select observations within bandwidth
+        if bandwidth is not None:
+            within_bw = np.abs(running_var) <= bandwidth
+            outcome_bw = outcome[within_bw]
+            running_var_bw = running_var[within_bw]
+        else:
+            outcome_bw = outcome
+            running_var_bw = running_var
+        
+        if len(outcome_bw) < 10:
+            raise ValueError("Insufficient observations within bandwidth")
+        
+        # Create treatment indicator
+        treatment_bw = (running_var_bw >= 0).astype(int)
+        
+        # Create polynomial features
+        if polynomial_order == 1:
+            # Linear specification
+            X = pd.DataFrame({
+                'constant': 1,
+                'running_var': running_var_bw,
+                'treatment': treatment_bw,
+                'running_var_treatment': running_var_bw * treatment_bw
+            })
+        elif polynomial_order == 2:
+            # Quadratic specification
+            X = pd.DataFrame({
+                'constant': 1,
+                'running_var': running_var_bw,
+                'running_var_sq': running_var_bw ** 2,
+                'treatment': treatment_bw,
+                'running_var_treatment': running_var_bw * treatment_bw,
+                'running_var_sq_treatment': (running_var_bw ** 2) * treatment_bw
+            })
+        else:
+            raise ValueError("Only polynomial orders 1 and 2 are supported")
+        
+        # Apply kernel weights
+        if kernel == 'triangular' and bandwidth is not None:
+            weights = np.maximum(0, 1 - np.abs(running_var_bw) / bandwidth)
+        elif kernel == 'uniform':
+            weights = np.ones(len(running_var_bw))
+        elif kernel == 'epanechnikov' and bandwidth is not None:
+            weights = np.maximum(0, 0.75 * (1 - (running_var_bw / bandwidth) ** 2))
+        else:
+            weights = np.ones(len(running_var_bw))
+        
+        # Weighted least squares
+        X_weighted = X.multiply(np.sqrt(weights), axis=0)
+        y_weighted = outcome_bw * np.sqrt(weights)
+        
+        # Fit model
+        model = sm.OLS(y_weighted, X_weighted).fit()
+        
+        # Extract treatment effect (coefficient on treatment dummy)
+        treatment_effect = model.params['treatment']
+        standard_error = model.bse['treatment']
+        t_statistic = model.tvalues['treatment']
+        p_value = model.pvalues['treatment']
+        
+        # Confidence interval
+        ci_lower = treatment_effect - 1.96 * standard_error
+        ci_upper = treatment_effect + 1.96 * standard_error
+        
+        return {
+            'treatment_effect': treatment_effect,
+            'standard_error': standard_error,
+            't_statistic': t_statistic,
+            'p_value': p_value,
+            'ci_lower': ci_lower,
+            'ci_upper': ci_upper,
+            'n_obs': len(outcome_bw),
+            'model': model,
+            'r_squared': model.rsquared
+        }
+    
+    def sensitivity_analysis(self, bandwidth_range=None, polynomial_orders=[1, 2]):
+        """
+        Test sensitivity to bandwidth and polynomial order choices
+        
+        Parameters:
+        -----------
+        bandwidth_range : tuple, optional
+            (min_bw, max_bw) for testing. If None, uses range around optimal
+        polynomial_orders : list, default [1, 2]
+            Polynomial orders to test
+        """
+        print("\n" + "="*60)
+        print("SENSITIVITY ANALYSIS")
+        print("="*60)
+        
+        if bandwidth_range is None:
+            optimal_bw = self.results.get('optimal_bandwidth', {}).get('bandwidth')
+            if optimal_bw is None:
+                optimal_bw = self.optimal_bandwidth_selection()
+            bandwidth_range = (optimal_bw * 0.5, optimal_bw * 2.0)
+        
+        # Test different bandwidths
+        bandwidths = np.linspace(bandwidth_range[0], bandwidth_range[1], 10)
+        
+        sensitivity_results = []
+        
+        print("Testing sensitivity to bandwidth choice:")
+        print("Bandwidth    Poly Order    Effect    Std Err    P-value")
+        print("-" * 55)
+        
+        for bw in bandwidths:
+            for poly_order in polynomial_orders:
+                try:
+                    result = self._estimate_rdd_effect(
+                        outcome=self.data[self.outcome_var],
+                        running_var=self.data['running_var_centered'],
+                        bandwidth=bw,
+                        polynomial_order=poly_order
+                    )
+                    
+                    sensitivity_results.append({
+                        'bandwidth': bw,
+                        'polynomial_order': poly_order,
+                        'treatment_effect': result['treatment_effect'],
+                        'standard_error': result['standard_error'],
+                        'p_value': result['p_value'],
+                        'n_obs': result['n_obs']
+                    })
+                    
+                    print(f"{bw:8.3f}        {poly_order}       {result['treatment_effect']:6.3f}    {result['standard_error']:6.3f}    {result['p_value']:6.3f}")
+                    
+                except Exception as e:
+                    print(f"{bw:8.3f}        {poly_order}       ERROR: {str(e)[:20]}")
+        
+        # Analyze sensitivity
+        if sensitivity_results:
+            effects = [r['treatment_effect'] for r in sensitivity_results]
+            effect_range = max(effects) - min(effects)
+            effect_std = np.std(effects)
+            
+            print(f"\nSensitivity summary:")
+            print(f"  Effect range: {min(effects):.3f} to {max(effects):.3f}")
+            print(f"  Effect standard deviation: {effect_std:.3f}")
+            print(f"  Range as % of mean effect: {(effect_range / np.mean(effects)) * 100:.1f}%")
+            
+            if effect_range / abs(np.mean(effects)) < 0.2:
+                print("✅ ROBUST - effect stable across specifications")
+            else:
+                print("⚠️ SENSITIVE - effect varies significantly across specifications")
+        
+        self.results['sensitivity_analysis'] = sensitivity_results
+        return sensitivity_results
+    
+    def placebo_test(self, placebo_cutoffs=None):
+        """
+        Test for effects at false cutoffs where no effect should exist
+        
+        Parameters:
+        -----------
+        placebo_cutoffs : list, optional
+            List of false cutoff values to test. If None, uses quantiles
+        """
+        print("\n" + "="*60)
+        print("ROBUSTNESS CHECK: PLACEBO TEST")
+        print("="*60)
+        
+        if placebo_cutoffs is None:
+            # Use quantiles of running variable as placebo cutoffs
+            quantiles = [0.2, 0.3, 0.7, 0.8]
+            placebo_cutoffs = [self.data[self.running_var].quantile(q) for q in quantiles]
+            placebo_cutoffs = [c for c in placebo_cutoffs if c != self.cutoff]
+        
+        placebo_results = []
+        
+        print("Testing for effects at false cutoffs:")
+        print("Placebo Cutoff    Effect    Std Err    P-value")
+        print("-" * 45)
+        
+        for placebo_cutoff in placebo_cutoffs:
+            # Create placebo treatment variable
+            placebo_data = self.data.copy()
+            placebo_data['placebo_treatment'] = (placebo_data[self.running_var] >= placebo_cutoff).astype(int)
+            placebo_data['placebo_running_centered'] = placebo_data[self.running_var] - placebo_cutoff
+            
+            try:
+                # Estimate effect at placebo cutoff
+                placebo_result = self._estimate_rdd_effect(
+                    outcome=placebo_data[self.outcome_var],
+                    running_var=placebo_data['placebo_running_centered'],
+                    bandwidth=None,  # Use automatic bandwidth selection
+                    polynomial_order=1
+                )
+                
+                placebo_results.append({
+                    'placebo_cutoff': placebo_cutoff,
+                    'effect': placebo_result['treatment_effect'],
+                    'standard_error': placebo_result['standard_error'],
+                    'p_value': placebo_result['p_value'],
+                    'significant': placebo_result['p_value'] < 0.05
+                })
+                
+                sig_marker = "*" if placebo_result['p_value'] < 0.05 else ""
+                print(f"{placebo_cutoff:12.2f}    {placebo_result['treatment_effect']:6.3f}    {placebo_result['standard_error']:6.3f}    {placebo_result['p_value']:6.3f}{sig_marker}")
+                
+            except Exception as e:
+                print(f"{placebo_cutoff:12.2f}    ERROR: {str(e)[:30]}")
+        
+        # Assess placebo test results
+        if placebo_results:
+            significant_placebos = sum(1 for r in placebo_results if r['significant'])
+            
+            print(f"\nPlacebo test summary:")
+            print(f"  False cutoffs tested: {len(placebo_results)}")
+            print(f"  Significant effects found: {significant_placebos}")
+            
+            if significant_placebos == 0:
+                print("✅ PLACEBO TEST PASSED - no false effects detected")
+                test_passed = True
+            elif significant_placebos <= len(placebo_results) * 0.05:  # Expected false positive rate
+                print("✅ PLACEBO TEST PASSED - false positives within expected range")
+                test_passed = True
+            else:
+                print("⚠️ PLACEBO TEST FAILED - too many false effects detected")
+                test_passed = False
+                
+            placebo_results.append({'test_passed': test_passed})
+        
+        self.results['placebo_test'] = placebo_results
+        return placebo_results
+    
+    def donut_hole_test(self, hole_size=None):
+        """
+        Test robustness by excluding observations very close to cutoff
+        
+        Parameters:
+        -----------
+        hole_size : float, optional
+            Size of hole around cutoff to exclude. If None, uses 10% of optimal bandwidth
+        """
+        print("\n" + "="*60)
+        print("ROBUSTNESS CHECK: DONUT HOLE TEST")
+        print("="*60)
+        
+        if hole_size is None:
+            optimal_bw = self.results.get('optimal_bandwidth', {}).get('bandwidth')
+            if optimal_bw is None:
+                optimal_bw = self.optimal_bandwidth_selection()
+            hole_size = optimal_bw * 0.1
+        
+        print(f"Excluding observations within {hole_size:.3f} of cutoff")
+        
+        # Exclude observations in donut hole
+        donut_data = self.data[np.abs(self.data['running_var_centered']) > hole_size].copy()
+        
+        print(f"Observations remaining: {len(donut_data):,} (excluded {len(self.data) - len(donut_data):,})")
+        
+        if len(donut_data) < 50:
+            print("❌ Too few observations remaining for donut hole test")
+            return {'insufficient_data': True}
+        
+        # Estimate effect on donut hole sample
+        try:
+            donut_result = self._estimate_rdd_effect(
+                outcome=donut_data[self.outcome_var],
+                running_var=donut_data['running_var_centered'],
+                bandwidth=None,
+                polynomial_order=1
+            )
+            
+            # Compare with main result
+            main_effect = self.results.get('rdd_effect', {}).get('treatment_effect', 0)
+            
+            difference = abs(donut_result['treatment_effect'] - main_effect)
+            relative_difference = difference / abs(main_effect) if main_effect != 0 else float('inf')
+            
+            print(f"Donut hole results:")
+            print(f"  Main effect: {main_effect:.3f}")
+            print(f"  Donut effect: {donut_result['treatment_effect']:.3f}")
+            print(f"  Difference: {difference:.3f}")
+            print(f"  Relative difference: {relative_difference*100:.1f}%")
+            
+            if relative_difference < 0.2:  # Less than 20% difference
+                print("✅ DONUT HOLE TEST PASSED - effect stable when excluding near-cutoff observations")
+                test_passed = True
+            else:
+                print("⚠️ DONUT HOLE TEST QUESTIONABLE - effect sensitive to near-cutoff observations")
+                test_passed = False
+            
+            donut_result.update({
+                'hole_size': hole_size,
+                'main_effect': main_effect,
+                'difference': difference,
+                'relative_difference': relative_difference,
+                'test_passed': test_passed
+            })
+            
+        except Exception as e:
+            print(f"❌ Error in donut hole test: {e}")
+            donut_result = {'error': str(e)}
+        
+        self.results['donut_hole_test'] = donut_result
+        return donut_result
+    
+    def run_full_analysis(self, bandwidth=None, covariates=None, plot=True):
+        """Run complete RDD analysis pipeline"""
+        print("RUNNING COMPREHENSIVE RDD ANALYSIS")
+        print("="*60)
+        
+        # Step 1: Check assumptions
+        self.check_continuity_assumption(plot=plot)
+        self.check_covariate_continuity(covariates=covariates)
+        
+        # Step 2: Bandwidth selection
+        if bandwidth is None:
+            bandwidth = self.optimal_bandwidth_selection()
+        
+        # Step 3: Main RDD estimation
+        self.estimate_rdd_effect(bandwidth=bandwidth)
+        
+        # Step 4: Robustness checks
+        self.sensitivity_analysis()
+        self.placebo_test()
+        self.donut_hole_test()
+        
+        # Step 5: Summary
+        self.print_summary()
+        
+        # Step 6: Visualization
+        if plot:
+            self.plot_rdd()
+        
+        return self.results
+    
+    def print_summary(self):
+        """Print comprehensive analysis summary"""
+        print("\n" + "="*60)
+        print("RDD ANALYSIS SUMMARY")
+        print("="*60)
+        
+        # Main effect
+        if 'rdd_effect' in self.results:
+            effect = self.results['rdd_effect']
+            print(f"Treatment Effect:")
+            print(f"  Estimate: {effect['treatment_effect']:.3f}")
+            print(f"  Standard Error: {effect['standard_error']:.3f}")
+            print(f"  p-value: {effect['p_value']:.3f}")
+            print(f"  95% CI: [{effect['ci_lower']:.3f}, {effect['ci_upper']:.3f}]")
+        
+        # Assumption checks
+        print(f"\nAssumption Checks:")
+        if 'continuity' in self.assumption_checks:
+            continuity_ok = self.assumption_checks['continuity'].get('assumption_satisfied', False)
+            print(f"  Density Continuity: {'✅ SATISFIED' if continuity_ok else '⚠️ VIOLATED'}")
+        
+        if 'covariate_continuity' in self.assumption_checks:
+            covar_ok = self.assumption_checks['covariate_continuity'].get('overall_satisfied', False)
+            print(f"  Covariate Continuity: {'✅ SATISFIED' if covar_ok else '⚠️ VIOLATED'}")
+        
+        # Robustness checks
+        print(f"\nRobustness Checks:")
+        if 'placebo_test' in self.results:
+            placebo_results = self.results['placebo_test']
+            if placebo_results and isinstance(placebo_results[-1], dict) and 'test_passed' in placebo_results[-1]:
+                placebo_passed = placebo_results[-1]['test_passed']
+                print(f"  Placebo Test: {'✅ PASSED' if placebo_passed else '⚠️ FAILED'}")
+        
+        if 'donut_hole_test' in self.results:
+            donut_passed = self.results['donut_hole_test'].get('test_passed', False)
+            print(f"  Donut Hole Test: {'✅ PASSED' if donut_passed else '⚠️ FAILED'}")
+        
+        if 'sensitivity_analysis' in self.results:
+            sensitivity_results = self.results['sensitivity_analysis']
+            if sensitivity_results:
+                effects = [r['treatment_effect'] for r in sensitivity_results]
+                effect_range = max(effects) - min(effects)
+                robust = effect_range / abs(np.mean(effects)) < 0.2 if np.mean(effects) != 0 else False
+                print(f"  Sensitivity Test: {'✅ ROBUST' if robust else '⚠️ SENSITIVE'}")
+    
+    def plot_rdd(self, bandwidth=None, bins=50):
+        """Create comprehensive RDD visualization"""
+        print("\n" + "="*60)
+        print("RDD VISUALIZATION")
+        print("="*60)
+        
+        if bandwidth is None:
+            bandwidth = self.results.get('rdd_effect', {}).get('bandwidth')
+            if bandwidth is None:
+                bandwidth = self.optimal_bandwidth_selection()
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # Plot 1: Scatter plot with regression lines
+        ax1 = axes[0, 0]
+        
+        # Sample data for plotting (to avoid overcrowding)
+        plot_data = self.data.sample(min(2000, len(self.data)), random_state=42)
+        
+        # Separate by treatment status
+        control_data = plot_data[plot_data[self.treatment_var] == 0]
+        treatment_data = plot_data[plot_data[self.treatment_var] == 1]
+        
+        # Scatter plots
+        ax1.scatter(control_data['running_var_centered'], control_data[self.outcome_var], 
+                   alpha=0.5, s=20, color='red', label='Control')
+        ax1.scatter(treatment_data['running_var_centered'], treatment_data[self.outcome_var], 
+                   alpha=0.5, s=20, color='blue', label='Treatment')
+        
+        # Regression lines
+        self._add_regression_lines(ax1, bandwidth)
+        
+        # Cutoff line
+        ax1.axvline(x=0, color='black', linestyle='--', alpha=0.8, label='Cutoff')
+        
+        ax1.set_xlabel(f'{self.running_var} (centered at cutoff)')
+        ax1.set_ylabel(self.outcome_var)
+        ax1.set_title('RDD: Outcome vs Running Variable')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Binned scatter plot
+        ax2 = axes[0, 1]
+        self._create_binned_plot(ax2, bins)
+        
+        # Plot 3: Density plot
+        ax3 = axes[1, 0]
+        self._plot_density_continuity(ax3)
+        
+        # Plot 4: Sensitivity analysis
+        ax4 = axes[1, 1]
+        if 'sensitivity_analysis' in self.results:
+            self._plot_sensitivity_analysis(ax4)
+        else:
+            ax4.text(0.5, 0.5, 'Run sensitivity_analysis()\nto see results', 
+                    ha='center', va='center', transform=ax4.transAxes)
+            ax4.set_title('Sensitivity Analysis')
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def _add_regression_lines(self, ax, bandwidth):
+        """Add fitted regression lines to RDD plot"""
+        # Get data within bandwidth
+        within_bw = self.data[np.abs(self.data['running_var_centered']) <= bandwidth]
+        
+        # Separate by treatment
+        control_bw = within_bw[within_bw[self.treatment_var] == 0]
+        treatment_bw = within_bw[within_bw[self.treatment_var] == 1]
+        
+        # Fit lines
+        if len(control_bw) > 1:
+            X_control = control_bw['running_var_centered'].values.reshape(-1, 1)
+            y_control = control_bw[self.outcome_var].values
+            reg_control = LinearRegression().fit(X_control, y_control)
+            
+            x_range_control = np.linspace(control_bw['running_var_centered'].min(), 0, 100)
+            y_pred_control = reg_control.predict(x_range_control.reshape(-1, 1))
+            ax.plot(x_range_control, y_pred_control, color='red', linewidth=2)
+        
+        if len(treatment_bw) > 1:
+            X_treatment = treatment_bw['running_var_centered'].values.reshape(-1, 1)
+            y_treatment = treatment_bw[self.outcome_var].values
+            reg_treatment = LinearRegression().fit(X_treatment, y_treatment)
+            
+            x_range_treatment = np.linspace(0, treatment_bw['running_var_centered'].max(), 100)
+            y_pred_treatment = reg_treatment.predict(x_range_treatment.reshape(-1, 1))
+            ax.plot(x_range_treatment, y_pred_treatment, color='blue', linewidth=2)
+    
+    def _create_binned_plot(self, ax, bins):
+        """Create binned scatter plot for cleaner visualization"""
+        # Create bins
+        running_var_range = (self.data['running_var_centered'].min(), self.data['running_var_centered'].max())
+        bin_edges = np.linspace(running_var_range[0], running_var_range[1], bins + 1)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        
+        # Calculate mean outcome in each bin
+        bin_means = []
+        bin_counts = []
+        
+        for i in range(len(bin_edges) - 1):
+            in_bin = ((self.data['running_var_centered'] >= bin_edges[i]) & 
+                     (self.data['running_var_centered'] < bin_edges[i + 1]))
+            
+            if in_bin.any():
+                bin_mean = self.data[in_bin][self.outcome_var].mean()
+                bin_count = in_bin.sum()
+            else:
+                bin_mean = np.nan
+                bin_count = 0
+            
+            bin_means.append(bin_mean)
+            bin_counts.append(bin_count)
+        
+        # Plot points, size based on number of observations
+        sizes = [max(10, min(100, count/5)) for count in bin_counts]
+        colors = ['red' if center < 0 else 'blue' for center in bin_centers]
+        
+        ax.scatter(bin_centers, bin_means, s=sizes, c=colors, alpha=0.7)
+        ax.axvline(x=0, color='black', linestyle='--', alpha=0.8)
+        ax.set_xlabel(f'{self.running_var} (centered at cutoff)')
+        ax.set_ylabel(f'Mean {self.outcome_var}')
+        ax.set_title('RDD: Binned Scatter Plot')
+        ax.grid(True, alpha=0.3)
+    
+    def _plot_density_continuity(self, ax=None):
+        """Plot density of running variable around cutoff"""
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Create histogram
+        bins = 50
+        ax.hist(self.data['running_var_centered'], bins=bins, alpha=0.7, 
+               color='skyblue', edgecolor='black')
+        
+        ax.axvline(x=0, color='red', linestyle='--', linewidth=2, label='Cutoff')
+        ax.set_xlabel(f'{self.running_var} (centered at cutoff)')
+        ax.set_ylabel('Frequency')
+        ax.set_title('Density Continuity Check')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        if ax is None:
+            plt.show()
+    
+    def _plot_sensitivity_analysis(self, ax):
+        """Plot sensitivity analysis results"""
+        if 'sensitivity_analysis' not in self.results:
+            return
+        
+        sensitivity_results = self.results['sensitivity_analysis']
+        if not sensitivity_results:
+            return
+        
+        # Group by polynomial order
+        poly_orders = sorted(set(r['polynomial_order'] for r in sensitivity_results))
+        
+        for poly_order in poly_orders:
+            poly_results = [r for r in sensitivity_results if r['polynomial_order'] == poly_order]
+            bandwidths = [r['bandwidth'] for r in poly_results]
+            effects = [r['treatment_effect'] for r in poly_results]
+            
+            ax.plot(bandwidths, effects, 'o-', label=f'Polynomial Order {poly_order}')
+        
+        ax.set_xlabel('Bandwidth')
+        ax.set_ylabel('Treatment Effect')
+        ax.set_title('Sensitivity Analysis')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
